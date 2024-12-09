@@ -1,5 +1,6 @@
 import argparse
 import functools
+import importlib
 import json
 import operator
 import os
@@ -8,7 +9,18 @@ from dataclasses import MISSING as _MISSING
 from dataclasses import Field, asdict, dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from pprint import pprint
-from typing import Any, Dict, Generic, List, Optional, Type, TypeVar, Union, get_type_hints
+from typing import (
+    Any,
+    Dict,
+    ForwardRef,
+    Generic,
+    List,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    get_type_hints,
+)
 
 T = TypeVar("T")
 MISSING: Any = "???"
@@ -47,7 +59,12 @@ def is_list(arg_type: Any) -> bool:
         bool: True if input type is `list`
     """
     try:
-        return arg_type is list or arg_type is List or arg_type.__origin__ is list or arg_type.__origin__ is List
+        return (
+            arg_type is list
+            or arg_type is List
+            or arg_type.__origin__ is list
+            or arg_type.__origin__ is List
+        )
     except AttributeError:
         return False
 
@@ -145,11 +162,39 @@ def my_get_type_hints(
     """
     r_dict = {}
     for base in cls.__class__.__bases__:
-        if base == object:
+        if isinstance(base, object):
             break
         r_dict.update(my_get_type_hints(base))
     r_dict.update(get_type_hints(cls))
     return r_dict
+
+
+def _get_class_import_path(cls: Type) -> str:
+    """Get the import path for a class."""
+    module = cls.__module__
+    if module == "__main__":
+        raise ValueError("Cannot serialize classes defined in __main__")
+    return f"{module}.{cls.__name__}"
+
+
+def _serialize_class_instance(obj: Any) -> str:
+    """Serialize a class instance to a string format."""
+    if obj is None:
+        return None
+
+    cls = obj.__class__
+    import_path = _get_class_import_path(cls)
+
+    if "builtins" in import_path:
+        return obj
+
+    # Get init parameters
+    if hasattr(obj, "__dict__"):
+        params = obj.__dict__
+        param_str = ", ".join(f"{k}={repr(v)}" for k, v in params.items())
+        return f"class::{import_path}({param_str})"
+
+    return f"class::{import_path}()"
 
 
 def _serialize(x):
@@ -171,6 +216,8 @@ def _serialize(x):
         return x.serialize()
     if isinstance(x, type) and issubclass(x, Serializable):
         return x.serialize(x)
+    if isinstance(x, object) and hasattr(x, "__class__") and not is_primitive_type(x):
+        return _serialize_class_instance(x)
     return x
 
 
@@ -216,7 +263,7 @@ def _deserialize_list(x: List, field_type: Type) -> List:
             raise ValueError(" [!] Coqpit does not support multi-type hinted 'List'")
         field_arg = field_args[0]
         # if field type is TypeVar set the current type by the value's type.
-        if isinstance(field_arg, TypeVar):
+        if isinstance(field_arg, (TypeVar, ForwardRef)):
             field_arg = type(x)
         return [_deserialize(xi, field_arg) for xi in x]
     return x
@@ -242,7 +289,9 @@ def _deserialize_union(x: Any, field_type: Type) -> Any:
     return x
 
 
-def _deserialize_primitive_types(x: Union[int, float, str, bool], field_type: Type) -> Union[int, float, str, bool]:
+def _deserialize_primitive_types(
+    x: Union[int, float, str, bool], field_type: Type
+) -> Union[int, float, str, bool]:
     """Deserialize python primitive types (float, int, str, bool).
     It handles `inf` values exclusively and keeps them float against int fields since int does not support inf values.
 
@@ -266,6 +315,78 @@ def _deserialize_primitive_types(x: Union[int, float, str, bool], field_type: Ty
     return None
 
 
+def instantiate_from_string(class_string):
+    """
+    Instantiate an object from its string representation.
+
+    Args:
+        class_string (str): String representation of object instance with format:
+            "class::module.path.ClassName(param1=val1,...)"
+
+    Returns:
+        Instance of the specified class with given parameters
+    """
+
+    # Split class path and parameters
+    class_path, params = class_string.split("(", 1)
+    params = params.rstrip(")")
+
+    # Remove 'class::' prefix and get module path and class name
+    if class_path.startswith("class::"):
+        class_path = class_path[7:]
+    module_path, class_name = class_path.rsplit(".", 1)
+
+    # Import module and get class
+    module = importlib.import_module(module_path)
+    cls = getattr(module, class_name)
+
+    # Parse parameters
+    param_dict = {}
+    if params:
+        # Split parameters by comma, but handle nested structures
+        param_pairs = []
+        current = []
+        nested_level = 0
+
+        for char in params:
+            if char == "," and nested_level == 0:
+                param_pairs.append("".join(current))
+                current = []
+            else:
+                if char in "[{(":
+                    nested_level += 1
+                elif char in "]})":
+                    nested_level -= 1
+                current.append(char)
+
+        if current:
+            param_pairs.append("".join(current))
+
+        # Convert parameters to dictionary
+        for param in param_pairs:
+            if "=" in param:
+                key, value = param.split("=", 1)
+                key = key.strip()
+                value = value.strip()
+
+                # Convert string values to Python objects
+                # TODO: do something more robust than eval
+                try:
+                    value = eval(value)
+                except Exception:
+                    # Keep as string if eval fails
+                    pass
+
+                param_dict[key] = value
+
+    # Instantiate class with parameters
+    return cls(**param_dict)
+
+
+def _deserialize_class_instance(class_str: str) -> Any:
+    return instantiate_from_string(class_str)
+
+
 def _deserialize(x: Any, field_type: Any) -> Any:
     """Pick the right desrialization for the given object and the corresponding field type.
 
@@ -278,6 +399,9 @@ def _deserialize(x: Any, field_type: Any) -> Any:
 
     """
     # pylint: disable=too-many-return-statements
+    if isinstance(x, str) and x.startswith("class::"):
+        print(x)
+        return _deserialize_class_instance(x)
     if is_dict(field_type):
         return _deserialize_dict(x)
     if is_list(field_type):
@@ -288,7 +412,9 @@ def _deserialize(x: Any, field_type: Any) -> Any:
         return field_type.deserialize_immutable(x)
     if is_primitive_type(field_type):
         return _deserialize_primitive_types(x, field_type)
-    raise ValueError(f" [!] '{type(x)}' value type of '{x}' does not match '{field_type}' field type.")
+    raise ValueError(
+        f" [!] '{type(x)}' value type of '{x}' does not match '{field_type}' field type."
+    )
 
 
 # Recursive setattr (supports dotted attr names)
@@ -342,7 +468,6 @@ class Serializable:
         dataclass_fields = fields(self)
 
         for field in dataclass_fields:
-
             value = getattr(self, field.name)
 
             if value is None:
@@ -353,7 +478,9 @@ class Serializable:
 
             if contract is not None:
                 if value is not None and not contract(value):
-                    raise ValueError(f"break the contract for {field.name}, {self.__class__.__name__}")
+                    raise ValueError(
+                        f"break the contract for {field.name}, {self.__class__.__name__}"
+                    )
 
     def validate(self):
         """validate if object can serialize / deserialize correctly."""
@@ -408,7 +535,9 @@ class Serializable:
                 init_kwargs[field.name] = value
                 continue
             if value == MISSING:
-                raise ValueError(f"deserialized with unknown value for {field.name} in {self.__name__}")
+                raise ValueError(
+                    f"deserialized with unknown value for {field.name} in {self.__name__}"
+                )
             value = _deserialize(value, field.type)
             init_kwargs[field.name] = value
         for k, v in init_kwargs.items():
@@ -443,7 +572,9 @@ class Serializable:
                 init_kwargs[field.name] = value
                 continue
             if value == MISSING:
-                raise ValueError(f"Deserialized with unknown value for {field.name} in {cls.__name__}")
+                raise ValueError(
+                    f"Deserialized with unknown value for {field.name} in {cls.__name__}"
+                )
             value = _deserialize(value, field.type)
             init_kwargs[field.name] = value
         return cls(**init_kwargs)
@@ -482,7 +613,11 @@ def _init_argparse(
         has_default = True
         default = field_default_factory()
 
-    if not has_default and not is_primitive_type(field_type) and not is_list(field_type):
+    if (
+        not has_default
+        and not is_primitive_type(field_type)
+        and not is_list(field_type)
+    ):
         # aggregate types (fields with a Coqpit subclass as type) are not supported without None
         return parser
     arg_prefix = field_name if arg_prefix == "" else f"{arg_prefix}.{field_name}"
@@ -499,7 +634,9 @@ def _init_argparse(
         # TODO: We need a more clear help msg for lists.
         if hasattr(field_type, "__args__"):  # if the list is hinted
             if len(field_type.__args__) > 1 and not relaxed_parser:
-                raise ValueError(" [!] Coqpit does not support multi-type hinted 'List'")
+                raise ValueError(
+                    " [!] Coqpit does not support multi-type hinted 'List'"
+                )
             list_field_type = field_type.__args__[0]
         else:
             raise ValueError(" [!] Coqpit does not support un-hinted 'List'")
@@ -510,7 +647,9 @@ def _init_argparse(
 
         if not has_default or field_default_factory is list:
             if not is_primitive_type(list_field_type) and not relaxed_parser:
-                raise NotImplementedError(" [!] Empty list with non primitive inner type is currently not supported.")
+                raise NotImplementedError(
+                    " [!] Empty list with non primitive inner type is currently not supported."
+                )
 
             # If the list's default value is None, the user can specify the entire list by passing multiple parameters
             parser.add_argument(
@@ -542,13 +681,18 @@ def _init_argparse(
             )
     elif issubclass(field_type, Serializable):
         return default.init_argparse(
-            parser, arg_prefix=arg_prefix, help_prefix=help_prefix, relaxed_parser=relaxed_parser
+            parser,
+            arg_prefix=arg_prefix,
+            help_prefix=help_prefix,
+            relaxed_parser=relaxed_parser,
         )
     elif isinstance(field_type(), bool):
 
         def parse_bool(x):
             if x not in ("true", "false"):
-                raise ValueError(f' [!] Value for boolean field must be either "true" or "false". Got "{x}".')
+                raise ValueError(
+                    f' [!] Value for boolean field must be either "true" or "false". Got "{x}".'
+                )
             return x == "true"
 
         parser.add_argument(
@@ -567,7 +711,9 @@ def _init_argparse(
         )
     else:
         if not relaxed_parser:
-            raise NotImplementedError(f" [!] '{field_type}' is not supported by arg_parser. Please file a bug report.")
+            raise NotImplementedError(
+                f" [!] '{field_type}' is not supported by arg_parser. Please file a bug report."
+            )
     return parser
 
 
@@ -663,6 +809,85 @@ class Coqpit(Serializable, MutableMapping):
     def check_values(self):
         pass
 
+    def diff(self, other: "Coqpit", exclude_defaults: bool = False) -> Dict:
+        """Compare two Coqpit objects and return their differences.
+
+        Args:
+            other (Coqpit): Another Coqpit object to compare with.
+            exclude_defaults (bool, optional): If True, exclude fields that have default values. Defaults to False.
+
+        Returns:
+            Dict: A dictionary containing the differences between the two objects with the following format:
+                {
+                    "added": fields present in other but not in self,
+                    "removed": fields present in self but not in other,
+                    "modified": fields present in both but with different values,
+                    "unchanged": fields present in both with the same values
+                }
+
+        Example:
+            >>> config1 = MyConfig(param1=1, param2="hello")
+            >>> config2 = MyConfig(param1=2, param2="hello", param3=True)
+            >>> diff = config1.diff(config2)
+            >>> print(diff)
+            {
+                'added': {'param3': True},
+                'removed': {},
+                'modified': {'param1': {'self': 1, 'other': 2}},
+                'unchanged': {'param2': 'hello'}
+            }
+        """
+
+        def _get_default_value(cls, field_name):
+            field = cls.__dataclass_fields__[field_name]
+            if field.default is not _MISSING:
+                return field.default
+            if field.default_factory is not _MISSING:
+                return field.default_factory()
+            return _MISSING
+
+        self_dict = self.to_dict()
+        other_dict = other.to_dict()
+
+        # Initialize difference categories
+        differences = {"added": {}, "removed": {}, "modified": {}, "unchanged": {}}
+
+        # Find added and modified fields
+        for key, other_value in other_dict.items():
+            if exclude_defaults:
+                default_value = _get_default_value(other.__class__, key)
+                if other_value == default_value:
+                    continue
+
+            if key not in self_dict:
+                differences["added"][key] = other_value
+            else:
+                self_value = self_dict[key]
+                if self_value != other_value:
+                    differences["modified"][key] = {
+                        "self": self_value,
+                        "other": other_value,
+                    }
+                else:
+                    differences["unchanged"][key] = self_value
+
+        # Find removed fields
+        for key, self_value in self_dict.items():
+            if exclude_defaults:
+                default_value = _get_default_value(self.__class__, key)
+                if self_value == default_value:
+                    continue
+
+            if key not in other_dict:
+                differences["removed"][key] = self_value
+            elif (
+                key not in differences["modified"]
+                and key not in differences["unchanged"]
+            ):
+                differences["unchanged"][key] = self_value
+
+        return differences
+
     def has(self, arg: str) -> bool:
         return arg in vars(self)
 
@@ -711,7 +936,7 @@ class Coqpit(Serializable, MutableMapping):
             file_name (str): path to the output json file.
         """
         with open(file_name, "w", encoding="utf8") as f:
-            json.dump(asdict(self), f, indent=4)
+            json.dump(self.serialize(), f, indent=4, default=_coqpit_json_default)
 
     def load_json(self, file_name: str) -> None:
         """Load a json file and update matching config fields with type checking.
@@ -732,7 +957,9 @@ class Coqpit(Serializable, MutableMapping):
 
     @classmethod
     def init_from_argparse(
-        cls, args: Optional[Union[argparse.Namespace, List[str]]] = None, arg_prefix: str = "coqpit"
+        cls,
+        args: Optional[Union[argparse.Namespace, List[str]]] = None,
+        arg_prefix: str = "coqpit",
     ) -> "Coqpit":
         """Create a new Coqpit instance from argparse input.
 
@@ -758,7 +985,9 @@ class Coqpit(Serializable, MutableMapping):
             has_default = False
             default = None
             field_default = field.default if field.default is not _MISSING else None
-            field_default_factory = field.default_factory if field.default_factory is not _MISSING else None
+            field_default_factory = (
+                field.default_factory if field.default_factory is not _MISSING else None
+            )
             if field_default:
                 has_default = True
                 default = field_default
@@ -766,7 +995,9 @@ class Coqpit(Serializable, MutableMapping):
                 has_default = True
                 default = field_default_factory()
 
-            if has_default and (not is_primitive_type(field.type) or is_list(field.type)):
+            if has_default and (
+                not is_primitive_type(field.type) or is_list(field.type)
+            ):
                 args_with_lists_processed[field.name] = default
 
         args_dict = vars(args)
@@ -780,7 +1011,9 @@ class Coqpit(Serializable, MutableMapping):
         return cls(**args_with_lists_processed)
 
     def parse_args(
-        self, args: Optional[Union[argparse.Namespace, List[str]]] = None, arg_prefix: str = "coqpit"
+        self,
+        args: Optional[Union[argparse.Namespace, List[str]]] = None,
+        arg_prefix: str = "coqpit",
     ) -> None:
         """Update config values from argparse arguments with some meta-programming ✨.
 
@@ -805,7 +1038,9 @@ class Coqpit(Serializable, MutableMapping):
             try:
                 rgetattr(self, k)
             except (TypeError, AttributeError) as e:
-                raise Exception(f" [!] '{k}' not exist to override from argparse.") from e
+                raise Exception(
+                    f" [!] '{k}' not exist to override from argparse."
+                ) from e
 
             rsetattr(self, k, v)
 
@@ -830,11 +1065,15 @@ class Coqpit(Serializable, MutableMapping):
         """
         if not args:
             # If args was not specified, parse from sys.argv
-            parser = self.init_argparse(arg_prefix=arg_prefix, relaxed_parser=relaxed_parser)
+            parser = self.init_argparse(
+                arg_prefix=arg_prefix, relaxed_parser=relaxed_parser
+            )
             args, unknown = parser.parse_known_args()
         if isinstance(args, list):
             # If a list was passed in (eg. the second result of `parse_known_args`, run that through argparse first to get a parsed Namespace
-            parser = self.init_argparse(arg_prefix=arg_prefix, relaxed_parser=relaxed_parser)
+            parser = self.init_argparse(
+                arg_prefix=arg_prefix, relaxed_parser=relaxed_parser
+            )
             args, unknown = parser.parse_known_args(args)
 
         self.parse_args(args)
@@ -940,7 +1179,9 @@ def check_argument(
         ), f" [!] prequested fields {prerequest} for {name} are not defined."
     # check if the path exists
     if is_path:
-        assert os.path.exists(c[name]), f' [!] path for {name} ("{c[name]}") does not exist.'
+        assert os.path.exists(
+            c[name]
+        ), f' [!] path for {name} ("{c[name]}") does not exist.'
     # skip the rest if the alternative field is defined.
     if alternative in c.keys() and c[alternative] is not None:
         return
@@ -949,6 +1190,8 @@ def check_argument(
         if max_val is not None:
             assert c[name] <= max_val, f" [!] {name} is larger than max value {max_val}"
         if min_val is not None:
-            assert c[name] >= min_val, f" [!] {name} is smaller than min value {min_val}"
+            assert (
+                c[name] >= min_val
+            ), f" [!] {name} is smaller than min value {min_val}"
         if enum_list is not None:
             assert c[name].lower() in enum_list, f" [!] {name} is not a valid value"
