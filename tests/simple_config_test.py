@@ -16,7 +16,9 @@ class SimpleConfig(Coqpit):
     # raise an error when accessing the value if it is not changed. It is a way to define
     val_k: int = MISSING
     # optional field
-    val_dict: dict = field(default_factory=lambda: {"val_aa": 10, "val_ss": "This is in a dict."})
+    val_dict: dict = field(
+        default_factory=lambda: {"val_aa": 10, "val_ss": "This is in a dict."}
+    )
     # list of list
     val_listoflist: List[List] = field(default_factory=lambda: [[1, 2], [3, 4]])
     val_listofunion: List[List[Union[str, int, bool]]] = field(
@@ -29,7 +31,9 @@ class SimpleConfig(Coqpit):
         """Check config fields"""
         c = asdict(self)
         check_argument("val_a", c, restricted=True, min_val=10, max_val=2056)
-        check_argument("val_b", c, restricted=True, min_val=128, max_val=4058, allow_none=True)
+        check_argument(
+            "val_b", c, restricted=True, min_val=128, max_val=4058, allow_none=True
+        )
         check_argument("val_c", c, restricted=True)
 
 

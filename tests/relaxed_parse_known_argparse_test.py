@@ -22,7 +22,9 @@ class SimpleConfig(Coqpit):
         """Check config fields"""
         c = asdict(self)
         check_argument("val_a", c, restricted=True, min_val=10, max_val=2056)
-        check_argument("val_b", c, restricted=True, min_val=128, max_val=4058, allow_none=True)
+        check_argument(
+            "val_b", c, restricted=True, min_val=128, max_val=4058, allow_none=True
+        )
 
 
 def test_parse_argparse():

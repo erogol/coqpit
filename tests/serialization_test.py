@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from typing import List
 
@@ -11,6 +12,13 @@ class Person(Coqpit):
 
 
 @dataclass
+class Group(Coqpit):
+    name: str = None
+    size: int = None
+    people: List[Person] = None
+
+
+@dataclass
 class Reference(Coqpit):
     name: str = "Coqpit"
     size: int = 3
@@ -21,29 +29,27 @@ class Reference(Coqpit):
             Person(name="Ceren", age=15),
         ]
     )
-    people_ids: List[int] = field(default_factory=lambda: [1, 2, 3])
 
 
-@dataclass
-class WithRequired(Coqpit):
-    name: str
-
-
-def test_new_from_dict():
-    ref_config = Reference(name="Fancy", size=3**10, people=[Person(name="Anonymous", age=42)])
-
-    new_config = Reference.new_from_dict(
-        {"name": "Fancy", "size": 3**10, "people": [{"name": "Anonymous", "age": 42}]}
+def test_serizalization():
+    file_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "serialization_test.json"
     )
+
+    ref_config = Reference()
+    ref_config.save_json(file_path)
+
+    new_config = Group()
+    new_config.load_json(file_path)
+    new_config.pprint()
 
     # check values
     assert len(ref_config) == len(new_config)
     assert ref_config.name == new_config.name
     assert ref_config.size == new_config.size
     assert ref_config.people[0].name == new_config.people[0].name
+    assert ref_config.people[1].name == new_config.people[1].name
+    assert ref_config.people[2].name == new_config.people[2].name
     assert ref_config.people[0].age == new_config.people[0].age
-
-    try:
-        WithRequired.new_from_dict({})
-    except ValueError as e:
-        assert "Missing required field" in e.args[0]
+    assert ref_config.people[1].age == new_config.people[1].age
+    assert ref_config.people[2].age == new_config.people[2].age
